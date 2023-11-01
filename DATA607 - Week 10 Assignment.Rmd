@@ -1,0 +1,337 @@
+---
+title: "DATA607 - Week 10 Assignment"
+author: "Gavriel Steinmetz-Silber"
+date: "2023-10-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Objectives
+
+Extend the code from "Text Mining with R" in two ways: 
+1. Work with a different corpus, and 
+2. Incorporate at least one additional sentiment lexicon
+
+## Text Mining with R
+
+In this section, I'll get the main code working from Chapter 2 of "Text Mining with R."
+
+The source is: 
+Julia Silge and David Robinson. 2017. Text Mining with R: A Tidy Approach (1st. ed.). O'Reilly Media, Inc. Chapter 2 can be found here: https://www.tidytextmining.com/sentiment.html
+
+Converting text to tidy, adding linenumber and chapter columns: 
+
+```{r}
+library(janeaustenr)
+library(dplyr)
+library(stringr)
+library(tidytext)
+
+tidy_books <- austen_books() %>%
+  group_by(book) %>%
+  mutate(
+    linenumber = row_number(),
+    chapter = cumsum(str_detect(text, 
+                                regex("^chapter [\\divxlc]", 
+                                      ignore_case = TRUE)))) %>%
+  ungroup() %>%
+  unnest_tokens(word, text)
+```
+
+Finding sentiment score for each word, counting positive and negative words in each section, defining index, pivoting wider to have negative and positive sentiment in separate columns, and calculating net sentiment:
+```{r}
+library(tidyr)
+
+jane_austen_sentiment <- tidy_books %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(book, index = linenumber %/% 80, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>% 
+  mutate(sentiment = positive - negative) 
+```
+
+And now plotting, using index as x-axis and sentiment as y-axis: 
+```{r}
+library(ggplot2)
+
+ggplot(jane_austen_sentiment, aes(index, sentiment, fill = book)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~book, ncol = 2, scales = "free_x")
+```
+
+The authors turned to finding the most common positive and negative words: 
+```{r}
+bing_word_counts <- tidy_books %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+
+bing_word_counts
+```
+They then visualize (grouping by sentiment):
+```{r}
+bing_word_counts %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment",
+       y = NULL)
+```
+
+This demonstrates wordcloud:
+```{r}
+library(wordcloud)
+
+tidy_books %>%
+  anti_join(stop_words) %>%
+  count(word) %>%
+  with(wordcloud(word, n, max.words = 100))
+```
+
+This demonstrates comparison.cloud() which requires reshape2’s acast() so the data is in a matrix:
+```{r}
+library(reshape2)
+
+tidy_books %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"),
+                   max.words = 100)
+```
+
+This demonstrates using chapters to define the tokens: 
+```{r}
+austen_chapters <- austen_books() %>%
+  group_by(book) %>%
+  unnest_tokens(chapter, text, token = "regex", 
+                pattern = "Chapter|CHAPTER [\\dIVXLC]") %>%
+  ungroup()
+
+austen_chapters %>% 
+  group_by(book) %>% 
+  summarise(chapters = n())
+
+```
+Finding which chapter has the highest proportion of negative words in each book: 
+
+```{r}
+bingnegative <- get_sentiments("bing") %>% 
+  filter(sentiment == "negative")
+
+wordcounts <- tidy_books %>%
+  group_by(book, chapter) %>%
+  summarize(words = n())
+
+tidy_books %>%
+  semi_join(bingnegative) %>%
+  group_by(book, chapter) %>%
+  summarize(negativewords = n()) %>%
+  left_join(wordcounts, by = c("book", "chapter")) %>%
+  mutate(ratio = negativewords/words) %>%
+  filter(chapter != 0) %>%
+  slice_max(ratio, n = 1) %>% 
+  ungroup()
+
+```
+
+## Kafka
+
+I turn now to a corpus of my choice: two Kafka texts. 
+
+### Sentiment Lexicon
+
+But first, and as mentioned in the objectives, I'm going to use a sentiment lexicon not discussed in the chapter of "Text Mining." Specifically, I'll use a general-purpose dictionary developed by Harvard. Unfortunately, I can't use get_sentiments:
+
+> get_sentiments("DictionaryGI")
+Error in match.arg(lexicon) : 
+  'arg' should be one of “bing”, “afinn”, “loughran”, “nrc”
+
+However, I can access DictionaryGI through the SentimentAnalysis library. I'll also present some basic facts about the dictionary.
+```{r}
+library(SentimentAnalysis)
+data(DictionaryGI) #loading the dataset
+summary(DictionaryGI)
+```
+
+It's not the most sophisticated; there are 2005 negative words and 1637 positive ones. As it stands, DictionaryGI has two lists (one of negative words and one of positive words). As such, I'll create my own df: 
+
+```{r}
+positive = data.frame(word = DictionaryGI$positive, sentiment = "positive")
+negative = data.frame(word = DictionaryGI$negative, sentiment = "negative")
+
+harvard_sentiment = rbind(positive, negative) 
+
+#It's ordered alphabetically by sentiment. That's totally fine, but I'll want to see the head and the tail:
+head(harvard_sentiment)
+tail(harvard_sentiment)
+```
+
+### Kafka - Setting Up
+
+As stated above, in my analysis, I want to take a look at Kafka's books. gutenbergr has two of Kafka's works: "Metamorphosis" and "The Trial."
+
+```{r}
+library(gutenbergr)
+kafka = gutenberg_download(c(5200, 7849))
+```
+
+I'll start by renaming the book column, and fixing the values in that column. I'll then add a column for line number so that we can later track the trajectory of sentiment. I'll also add a column for chapter. In "Metamorphosis," the chapter starts are noted with "I," "II," and "III." In "The Trial," the format is "Chapter One," Chapter Two," etc. Finally, I'll unnest (each token is a word) and remove stop words. 
+
+```{r}
+tidy_kafka = kafka %>%
+  group_by(gutenberg_id) %>% 
+  rename(book = gutenberg_id) %>% 
+  mutate(
+    book = case_when(
+    book == "5200" ~ "Metamorphosis",
+    book == "7849" ~ "The Trial"), 
+    linenumber = row_number(),
+    chapter = cumsum(
+      str_detect(
+        text, regex("^I+$|Chapter.+$")))) %>% 
+    ungroup() %>%
+  unnest_tokens(word, text) %>% 
+  anti_join(stop_words)
+```
+
+Now that it's tidy, we can inner join with harvard_sentiment (the dictionary) so that we only retain rows that are in both dataframes. This is a prerequisite for further analysis. 
+
+```{r}
+kafka_sentiment = tidy_kafka %>% 
+  inner_join(harvard_sentiment, by = "word")
+head(kafka_sentiment)
+```
+
+###Analysis
+
+I begin by finding out which of the two books is more positive. kafka_sentiment is already set up, so this is a simple task:
+
+```{r}
+kafka_sentiment %>%
+  group_by(book) %>%
+  summarize(percent_positive = mean(sentiment == "positive") * 100)
+```
+
+Both books are fairly negative, but the one that ends with the protagonist getting stabbed to death ("like a dog!") is marginally more positive. I now move on to more interesting and complex tasks.
+
+First, I'll see how the sentiment changes in the stories. As the authors of "Text Mining" suggest, I'll use an index to ensure equal lengths (namely 80 lines)
+
+```{r}
+kafka_sentiment = kafka_sentiment %>% 
+  count(book, index = linenumber %/% 80, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>% 
+  mutate(sentiment = positive - negative) 
+head(kafka_sentiment)
+```
+
+And visualize below: 
+```{r}
+ggplot(kafka_sentiment, aes(index, sentiment, fill = book)) + 
+  geom_col(show.legend = FALSE) + 
+  facet_wrap(~book, ncol = 2, scales = "free_x")
+```
+
+The results are remarkable, especially when contrasted with jane_austen_sentiment (earlier in the file). While Austen's books rarely dipped below 0, Kafka's typically live in the negative sentiment. I'd expect the trajectory of many books to be: start positive, then go negative, then end positive. This is obviously not the case with Kafka's.
+
+It's worth pointing out: "The Trial" ending with negative sentiment is unsurprising (as aforementioned, Josef gets killed at the end of the book). I was a bit more surprised to see "Metamorphosis" end positively since the main character, Gregor, also dies. Upon further reflection, it makes perfect sense. Gregor's parents and sister are relieved when he finally dies. For example: "With all the worry they had been having of late her cheeks had become pale, but, while they were talking, Mr. and Mrs. Samsa were struck, almost simultaneously, with the thought of how their daughter was blossoming into a well built and beautiful young lady." This accounts for the net positive sentiment towards the end of the book.
+
+I turn now to consider which words contributed most to the positive and negative sentiments across the two books: 
+
+```{r}
+tidy_kafka %>%
+  inner_join(harvard_sentiment) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+```
+
+The results are instructive. First, the lexicon clearly considers "hand" both positive and negative. That makes it fairly useless for analysis. The same is true of "matter" and "arrest." We also see "miss" contributing quite a bit of negative sentiment. And indeed, sometimes the word miss is used as a verb. However, in "The Trial," there are numerous references to "Miss Bürstner" and so it's misleading to count "miss" as negative.  I'll account for these words before I visualize the most common positive and negative words. 
+
+```{r}
+custom_stop_words = bind_rows(tibble(word = c("hand", "matter", "arrest", "miss"),  
+                                      lexicon = c("custom")), 
+                               stop_words)
+
+tidy_kafka = tidy_kafka %>% 
+  anti_join(custom_stop_words)
+
+tidy_kafka %>%
+  inner_join(harvard_sentiment) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup() %>% 
+    group_by(sentiment) %>%
+  slice_max(n, n = 10) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment",
+       y = NULL)
+
+```
+
+These are the words contributing most to the positive and negative sentiments in the two Kafka books. There are no words that appear in both, thanks to custom_stop_words.
+
+I'll now do a couple of visualizations of the words that appear most. Because I modified tidy_kafka already, there's no need for further anti_joins. First, a basic wordcloud:
+
+```{r}
+tidy_kafka %>% 
+  count(word) %>%
+  with(wordcloud(word, n, max.words = 60))
+```
+
+Most of these are wholly unsurprising: "Gregor" is the main character in "Metamorphosis," and "lawyer" occurs a lot in "The Trial" since the book is about, well, a trial. The frequency of "time" and "door" is quite interesting though. Both have much symbolism in these books, and their frequency is an invitation to consider the symbolism further (for another occasion).
+
+Let's use a comparison cloud to visualize the positive and negative words again. In order to use comparison.cloud, we need to use reshape2’s acast() to get the data in a matrix:
+
+
+```{r}
+tidy_kafka %>%
+  inner_join(harvard_sentiment) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"),
+                   max.words = 60)
+```
+
+It's worth wondering whether "law" should be considered positive in the context of "The Trial."
+
+The final thing I want to do is to consider which chapter of each book had the most negative sentiment. This may not be all that interesting, since these books don't have many chapters. But it's good practice anyways:
+
+```{r}
+harvard_negative = harvard_sentiment %>% 
+  filter(sentiment == "negative")
+
+wordcounts = tidy_kafka %>%
+  group_by(book, chapter) %>%
+  summarize(words = n())
+
+tidy_kafka %>%
+  semi_join(harvard_negative) %>%
+  group_by(book, chapter) %>%
+  summarize(negativewords = n()) %>%
+  left_join(wordcounts, by = c("book", "chapter")) %>%
+  mutate(ratio = negativewords/words) %>%
+  filter(chapter != 0) %>%
+  slice_max(ratio, n = 1) %>% 
+  ungroup()
+```
+
+The first chapter of "Metamorphosis" is its most negative, while the final chapter of "The Trial" is its most negative. This isn't totally news to us since we made a similar observation earlier when considering the trajectory of sentiment in the two books. However, specifying that it's actually the first and last chapter is in some ways news. 
+
+### Conclusion 
+
+I used this exercise primarily to gain experience with sentiment analysis. I selected two Kafka books, "Metamorphosis" and "The Trial" as my corpus. I largely followed the workflow from "Text Mining with R" and I had some interesting findings along the way--I'll briefly discuss the most compelling ones:
+
+First, these two books are quite negative, especially in contrast to the Austen books that are analyzed in the reading. Second, there are some differences in the trajectory of sentiment. The most negative chapter in "Metamorphosis" is actually the first! On the other hand, the start of "The Trial" is positive, with the final chapter being its most negative. Again, though, negative sentiment is present throughout much of both books--I suspect more so than in many other novels. Finally, the words "time" and "door" occur most throughout these two books. In fact, they are more frequent than even characters' names (although "Gregor" is a close third place). 
+
+Given these findings, I have two recommendations:
+
+First, I stated my hypothesis that these books have an overall more negative sentiment than other novels. With more time, I'd have investigated this, perhaps by taking a large sample of novels and comparing the ratios. Second, the frequency of "time" and "door" is thought-provoking. It's worth thinking more deeply about their meanings in these books (next time I re-read), as well as to see whether those words play a large role in others of Kafka's works as well. 
